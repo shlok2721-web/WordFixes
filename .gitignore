@@ -1,0 +1,10 @@
+/target
+/upstream
+
+# Personal note vaults — never commit
+# personal vaults, if you drop one here again
+/MyNotes
+/References
+
+# Phone-side screenshots / photos, kept locally for reference only
+/NotForGit Phone side of things/

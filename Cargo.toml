@@ -1,0 +1,63 @@
+[package]
+name = "notes"
+version = "0.0.3"
+edition = "2021"
+description = "GTK4 notes app for Linux that also hosts a WebDAV sync server"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/kalotrapezis/Notes"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
+# v1_5 gates adw::PreferencesDialog (Server & Sync settings); v1_7 adds
+# adw::WrapBox, used for the wrapping Markdown formatting toolbar.
+adw = { package = "libadwaita", version = "0.7", features = ["v1_7"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v5"] }
+anyhow = "1"
+dav-server = { version = "0.7", features = ["localfs"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+http-body-util = "0.1"
+base64 = "0.22"
+dirs = "5"
+notify = "7"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sourceview5 = "0.9"
+rand = "0.10.2"
+ureq = "2"
+
+[package.metadata.deb]
+maintainer = "Notes contributors"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/notes", "usr/bin/", "755"],
+    ["data/dev.local.Notes.desktop", "usr/share/applications/", "644"],
+    ["README.md", "usr/share/doc/notes/README", "644"],
+
+    # App icon in the standard hicolor theme, so the desktop launcher/menu
+    # resolves the .desktop file's `Icon=dev.local.Notes`.
+    ["data/icons/hicolor/48x48/apps/dev.local.Notes.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["data/icons/hicolor/64x64/apps/dev.local.Notes.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["data/icons/hicolor/128x128/apps/dev.local.Notes.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["data/icons/hicolor/256x256/apps/dev.local.Notes.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["data/icons/hicolor/512x512/apps/dev.local.Notes.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+
+    # The app's own bundled icon set, loaded at runtime from this exact path by
+    # install_icons() (main.rs) and placed ahead of the desktop theme. Includes
+    # the symbolic action glyphs the toolbar/sidebar use on every desktop.
+    ["data/icons/hicolor/index.theme", "usr/share/notes/icons/hicolor/", "644"],
+    ["data/icons/hicolor/scalable/actions/*.svg", "usr/share/notes/icons/hicolor/scalable/actions/", "644"],
+    ["data/icons/hicolor/48x48/apps/*.png", "usr/share/notes/icons/hicolor/48x48/apps/", "644"],
+    ["data/icons/hicolor/64x64/apps/*.png", "usr/share/notes/icons/hicolor/64x64/apps/", "644"],
+    ["data/icons/hicolor/128x128/apps/*.png", "usr/share/notes/icons/hicolor/128x128/apps/", "644"],
+    ["data/icons/hicolor/256x256/apps/*.png", "usr/share/notes/icons/hicolor/256x256/apps/", "644"],
+    ["data/icons/hicolor/512x512/apps/*.png", "usr/share/notes/icons/hicolor/512x512/apps/", "644"],
+]
+
+[lib]
+name = "notes"
+path = "src/lib.rs"

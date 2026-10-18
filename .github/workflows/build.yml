@@ -1,0 +1,46 @@
+name: Build Notes for Arch Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Arch Linux container
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            archlinux:latest \
+            bash -lc '
+              pacman -Syu --noconfirm --needed \
+                base-devel pkgconf gtk4 libadwaita \
+                gtksourceview5 rust &&
+              cargo test --locked &&
+              cargo build --release --locked &&
+              mkdir -p dist &&
+              install -Dm755 target/release/notes dist/notes &&
+              printf "%s\n" \
+                "Arch Linux build of Notes" \
+                "Requires gtk4, libadwaita, and gtksourceview5" \
+                > dist/README-ARCH.txt &&
+              tar -C dist -cJf /src/notes-archlinux-x86_64.tar.xz \
+                notes README-ARCH.txt
+            '
+
+      - name: Upload executable archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-archlinux-x86_64
+          path: notes-archlinux-x86_64.tar.xz
+          if-no-files-found: error
+          retention-days: 30

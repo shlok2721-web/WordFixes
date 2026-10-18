@@ -1,0 +1,341 @@
+//! Whole-vault backup: zips the entire data directory (`notes/`, `notes-md/`,
+//! and anything else living beside them) into a single `.zip` the user can
+//! stash somewhere safe. Read-only over the vault — it never touches the
+//! originals.
+
+use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use zip::write::SimpleFileOptions;
+
+/// A suggested backup filename, e.g. `notes-backup-2026-07-21.zip`. The date is
+/// passed in rather than read from the clock so the caller stays in control
+/// (and so this is testable).
+pub fn suggested_filename(date: &str) -> String {
+    format!("notes-backup-{date}.zip")
+}
+
+/// Writes a `.zip` of everything under `data_dir` to `dest`. Entry paths inside
+/// the archive are relative to `data_dir`, so unzipping reproduces the vault
+/// layout directly. Returns how many files were written.
+pub fn export(data_dir: &Path, dest: &Path) -> Result<usize> {
+    let file =
+        File::create(dest).with_context(|| format!("creating backup file {}", dest.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut count = 0;
+    let mut buf = Vec::new();
+    let mut stack = vec![data_dir.to_path_buf()];
+    // Iterative walk so a deeply-nested vault can't blow the stack, and so a
+    // single unreadable entry is skipped rather than aborting the whole backup.
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("backup: skipping unreadable dir {}: {e}", dir.display());
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(data_dir) else {
+                continue;
+            };
+            // Zip paths are always forward-slashed, regardless of platform.
+            let name = rel.to_string_lossy().replace('\\', "/");
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                stack.push(path);
+                continue;
+            }
+            let mut f = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("backup: skipping unreadable file {}: {e}", path.display());
+                    continue;
+                }
+            };
+            buf.clear();
+            if let Err(e) = f.read_to_end(&mut buf) {
+                eprintln!(
+                    "backup: skipping file {} after read error: {e}",
+                    path.display()
+                );
+                continue;
+            }
+            zip.start_file(&name, options)
+                .with_context(|| format!("adding {name} to backup"))?;
+            zip.write_all(&buf)
+                .with_context(|| format!("writing {name} to backup"))?;
+            count += 1;
+        }
+    }
+    zip.finish().context("finalising backup archive")?;
+    Ok(count)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored_files: usize,
+    /// A full snapshot of the vault immediately before the restore. Keeping it
+    /// beside the live vault makes an accidental restore reversible.
+    pub recovery_backup: PathBuf,
+}
+
+const MAX_RESTORE_FILES: usize = 100_000;
+const MAX_RESTORE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Validates and merges a backup into the live vault. Files present in the
+/// archive replace files at the same relative path; local-only files are kept.
+/// Before the first live file is touched, a full recovery backup is created.
+pub fn restore(archive_path: &Path, data_dir: &Path) -> Result<RestoreReport> {
+    let stage =
+        std::env::temp_dir().join(format!("notes-restore-stage-{}", crate::model::new_uuid()));
+    std::fs::create_dir_all(&stage)
+        .with_context(|| format!("creating restore staging folder {}", stage.display()))?;
+
+    let result = (|| {
+        let restored_files = extract_validated(archive_path, &stage)?;
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating notes folder {}", data_dir.display()))?;
+
+        let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+        let recovery_backup = parent.join(format!(
+            "notes-before-restore-{}.zip",
+            crate::model::new_uuid()
+        ));
+        export(data_dir, &recovery_backup).context("creating the pre-restore safety backup")?;
+
+        merge_tree(&stage, data_dir).with_context(|| {
+            format!(
+                "restoring files; the original vault is safe in {}",
+                recovery_backup.display()
+            )
+        })?;
+        Ok(RestoreReport {
+            restored_files,
+            recovery_backup,
+        })
+    })();
+
+    // This directory is generated by us under the OS temp directory and never
+    // contains user originals. A failed cleanup must not turn a good restore
+    // into a reported failure.
+    if let Err(e) = std::fs::remove_dir_all(&stage) {
+        eprintln!(
+            "restore: could not remove staging folder {}: {e}",
+            stage.display()
+        );
+    }
+    result
+}
+
+fn extract_validated(archive_path: &Path, stage: &Path) -> Result<usize> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("opening backup {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("the selected file is not a valid zip")?;
+    if archive.len() > MAX_RESTORE_FILES {
+        anyhow::bail!("backup contains too many entries");
+    }
+
+    let mut total = 0_u64;
+    let mut files = 0;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).context("reading a backup entry")?;
+        total = total
+            .checked_add(entry.size())
+            .filter(|n| *n <= MAX_RESTORE_BYTES)
+            .context("backup is too large to restore safely")?;
+
+        let relative = entry
+            .enclosed_name()
+            .context("backup contains an unsafe path")?
+            .to_path_buf();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            anyhow::bail!("backup contains a symbolic link, which is not supported");
+        }
+
+        let output = stage.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output)
+                .with_context(|| format!("creating staged folder {}", output.display()))?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating staged folder {}", parent.display()))?;
+        }
+        let mut target =
+            File::create(&output).with_context(|| format!("staging {}", output.display()))?;
+        std::io::copy(&mut entry, &mut target)
+            .with_context(|| format!("extracting {}", output.display()))?;
+        files += 1;
+    }
+    Ok(files)
+}
+
+fn merge_tree(source: &Path, destination: &Path) -> Result<()> {
+    let mut stack = vec![source.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("reading staged folder {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(source)?;
+            let target = destination.join(relative);
+            if entry.file_type()?.is_dir() {
+                std::fs::create_dir_all(&target)?;
+                stack.push(path);
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = target.with_file_name(format!(
+                ".{}.restore-{}",
+                target.file_name().unwrap_or_default().to_string_lossy(),
+                crate::model::new_uuid()
+            ));
+            std::fs::copy(&path, &temporary)
+                .with_context(|| format!("copying restored file {}", target.display()))?;
+            std::fs::rename(&temporary, &target)
+                .with_context(|| format!("installing restored file {}", target.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sn-bk-{tag}-{}", crate::model::new_uuid()))
+    }
+
+    #[test]
+    fn suggested_filename_uses_the_date() {
+        assert_eq!(
+            suggested_filename("2026-07-21"),
+            "notes-backup-2026-07-21.zip"
+        );
+    }
+
+    #[test]
+    fn export_captures_the_whole_tree_and_round_trips() {
+        let src = tmp("src");
+        std::fs::create_dir_all(src.join("notes/Work")).unwrap();
+        std::fs::create_dir_all(src.join("notes-md")).unwrap();
+        std::fs::write(src.join("notes/a.json"), b"{\"id\":\"a\"}").unwrap();
+        std::fs::write(src.join("notes/Work/b.json"), "τίτλος".as_bytes()).unwrap();
+        std::fs::write(src.join("notes-md/a.md"), b"# hi").unwrap();
+
+        let dest = tmp("out").with_extension("zip");
+        let n = export(&src, &dest).unwrap();
+        assert_eq!(n, 3);
+
+        // Re-open the archive and confirm every file survived with its bytes and
+        // its vault-relative path — a backup that silently drops or corrupts a
+        // note is worse than none.
+        let mut zip = zip::ZipArchive::new(File::open(&dest).unwrap()).unwrap();
+        let mut got = std::collections::BTreeMap::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let mut s = Vec::new();
+            e.read_to_end(&mut s).unwrap();
+            got.insert(e.name().to_string(), s);
+        }
+        assert_eq!(
+            got.get("notes/a.json").map(|v| v.as_slice()),
+            Some(&b"{\"id\":\"a\"}"[..])
+        );
+        assert_eq!(
+            got.get("notes/Work/b.json").map(|v| v.as_slice()),
+            Some("τίτλος".as_bytes())
+        );
+        assert_eq!(
+            got.get("notes-md/a.md").map(|v| v.as_slice()),
+            Some(&b"# hi"[..])
+        );
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn export_of_an_empty_vault_makes_a_valid_empty_zip() {
+        let src = tmp("empty");
+        std::fs::create_dir_all(&src).unwrap();
+        let dest = tmp("emptyout").with_extension("zip");
+        assert_eq!(export(&src, &dest).unwrap(), 0);
+        // A zero-entry archive must still be a readable zip, not a truncated file.
+        let zip = zip::ZipArchive::new(File::open(&dest).unwrap()).unwrap();
+        assert_eq!(zip.len(), 0);
+    }
+
+    #[test]
+    fn restore_replaces_matching_files_keeps_local_only_files_and_makes_a_safety_backup() {
+        let snapshot = tmp("restore-snapshot");
+        std::fs::create_dir_all(snapshot.join("notes")).unwrap();
+        std::fs::write(snapshot.join("notes/a.json"), b"backup version").unwrap();
+        std::fs::write(snapshot.join("folders.json"), b"backup folders").unwrap();
+        let archive = tmp("restore-archive").with_extension("zip");
+        export(&snapshot, &archive).unwrap();
+
+        let live = tmp("restore-live");
+        std::fs::create_dir_all(live.join("notes")).unwrap();
+        std::fs::write(live.join("notes/a.json"), b"changed after backup").unwrap();
+        std::fs::write(live.join("notes/local-only.json"), b"keep me").unwrap();
+
+        let report = restore(&archive, &live).unwrap();
+        assert_eq!(report.restored_files, 2);
+        assert_eq!(
+            std::fs::read(live.join("notes/a.json")).unwrap(),
+            b"backup version"
+        );
+        assert_eq!(
+            std::fs::read(live.join("folders.json")).unwrap(),
+            b"backup folders"
+        );
+        assert_eq!(
+            std::fs::read(live.join("notes/local-only.json")).unwrap(),
+            b"keep me"
+        );
+
+        // The safety archive captures the pre-restore bytes, making the
+        // overwrite reversible instead of merely promising that it is safe.
+        let mut safety = zip::ZipArchive::new(File::open(report.recovery_backup).unwrap()).unwrap();
+        let mut old = Vec::new();
+        safety
+            .by_name("notes/a.json")
+            .unwrap()
+            .read_to_end(&mut old)
+            .unwrap();
+        assert_eq!(old, b"changed after backup");
+    }
+
+    #[test]
+    fn restore_rejects_path_traversal_before_touching_the_vault() {
+        let archive = tmp("unsafe-archive").with_extension("zip");
+        let file = File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("../outside.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"bad").unwrap();
+        zip.finish().unwrap();
+
+        let live = tmp("unsafe-live");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("still-here"), b"safe").unwrap();
+        let error = restore(&archive, &live).unwrap_err().to_string();
+        assert!(error.contains("unsafe path"), "{error}");
+        assert_eq!(std::fs::read(live.join("still-here")).unwrap(), b"safe");
+    }
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Notes
+Comment=Notes app and WebDAV sync server for Simple Notes Sync
+Exec=notes
+Icon=dev.local.Notes
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=notes;markdown;webdav;sync;
+StartupNotify=true
