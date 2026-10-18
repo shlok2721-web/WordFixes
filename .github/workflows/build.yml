@@ -25,8 +25,8 @@ jobs:
               pacman -Syu --noconfirm --needed \
                 base-devel pkgconf gtk4 libadwaita \
                 gtksourceview5 rust &&
-              cargo test --locked &&
-              cargo build --release --locked &&
+              cargo test &&
+              cargo build --release &&
               mkdir -p dist &&
               install -Dm755 target/release/notes dist/notes &&
               printf "%s\n" \
